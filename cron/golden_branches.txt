@@ -1,0 +1,7 @@
+# Branches for which the nightly Jenkins job `Update_Golden_Code` should be triggered.
+# - One branch per line.
+# - Lines starting with `#` and blank lines are ignored.
+# - Inline `#` comments after a value are stripped.
+# - Add or remove branches here; no script change needed.
+
+main

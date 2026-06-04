@@ -1,0 +1,9 @@
+# Install on bgl-ads-619 (vrajeshe crontab):
+#   crontab /nobackup/vrajeshe/BOT/cron/sync_users_619_to_577.cron
+#
+# Midnight local time — push users.db from BOT -> WEBEXBOT on vxr-slurm-577.
+SHELL=/bin/bash
+PATH=/usr/bin:/bin
+TZ=Asia/Kolkata
+
+0 0 * * * /nobackup/vrajeshe/BOT/sync_users_619_to_577.sh

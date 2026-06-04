@@ -1,0 +1,52 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.env.local
+cron/.jenkins_golden.env
+cron/golden.log
+
+# User database (per-user encrypted PATs)
+users.db
+users.db.*
+
+# Logs
+bot.log
+*.log
+nohup.out
+logs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.virtualenv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Build artifacts / scratch
+build/
+dist/
+*.egg
+*.bak
+*.tmp
+*.orig
+
+# Local one-shot scripts (keep `examples/` but not arbitrary scratch)
+_scratch_*.py
+_local_*.py
