@@ -28,6 +28,7 @@ PAT model, and uses Webex DMs as the primary UX.
 - [User registration model](#user-registration-model)
 - [Bot commands](#bot-commands)
 - [Submodule workflows](#submodule-workflows)
+- [Usage logging](#usage-logging)
 - [Backports](#backports)
 - [Jenkins integration](#jenkins-integration)
 - [Scheduled jobs](#scheduled-jobs)
@@ -62,6 +63,9 @@ PAT model, and uses Webex DMs as the primary UX.
   cron-based parameterised job triggering with a branch list file.
 - **Failover-friendly** — runs on a standby host using the same Webex bot
   token and rsyncs its encrypted user store nightly between hosts.
+- **Usage telemetry** — every command is recorded in a rotating
+  `usage.log` (5 MB ring buffer, PATs redacted) and inspectable via the
+  admin-only `usage_log` command.
 
 ---
 
@@ -206,6 +210,7 @@ Send any of these in the shared room (mention the bot first) or in DM
 | `whoami` | Show registration status + GitHub login |
 | `register <PAT>` / `renew <PAT>` / `unregister` | Manage your stored PAT |
 | `users` | (admin) list registered users |
+| `usage_log` / `usage_log tail [N]` / `usage_log all` / `usage_log stats` / `usage_log <user@example.com>` | (admin) Inspect or export the per-command usage log — see [§ Usage logging](#usage-logging) |
 | **PR monitoring** | |
 | `monitor <PR_URL\|PR_ID>` | Start watching a PR's checks |
 | `status <PR_ID>` / `checks <PR_ID>` | Current checks summary |
@@ -274,6 +279,43 @@ in the PR body for transparency.
 
 The PR body for the multi-row case is rendered as a markdown table with
 clickable links to each `from`/`to` commit.
+
+---
+
+## Usage logging
+
+Every dispatched command is recorded as one JSON line in a rotating
+on-disk log so you can understand who is using what, spot errors, and
+guide future improvements.
+
+| Aspect | Behaviour |
+|---|---|
+| **Where** | `usage.log` next to `bot.py` (override with `USAGE_LOG_PATH`). |
+| **Format** | JSONL — one `{"ts":...,"user":...,"cmd":...,"args":...,"source":...,"outcome":...,"detail":...,"elapsed_ms":...}` record per line. |
+| **Disk cap** | **5 MB** total: 2.5 MB active + 2.5 MB rotated backup; oldest entries auto-pruned. |
+| **PAT redaction** | `register`, `renew`, and `renew_token` arguments are written as the literal `<redacted>` — raw tokens **never** touch the file. |
+| **Log-injection guard** | All free-form fields have CR/LF/TAB stripped and are length-bounded before write. |
+| **Failure mode** | Logger swallows its own exceptions — usage telemetry can never crash the bot. |
+
+### Inspecting the log (admin only)
+
+```
+usage_log              # last 100 entries inline (Webex code block)
+usage_log tail 50      # last N entries (max 1000)
+usage_log all          # full log delivered as a .jsonl file attachment
+usage_log stats        # aggregate counts: by command, by user, errors per cmd
+usage_log <user@…>     # full log filtered to that user (file attached)
+```
+
+Anyone other than `ADMIN_EMAIL` calling `usage_log` gets a `🚫 admin-only` reply.
+
+### Sample entries
+
+```json
+{"ts":"2026-06-08T05:21:11Z","user":"alice@example.com","cmd":"register","args":"<redacted>","source":"dm","outcome":"ok","detail":"","elapsed_ms":42}
+{"ts":"2026-06-08T05:21:34Z","user":"alice@example.com","cmd":"monitor","args":"https://github.example.com/myorg/foo/pull/123","source":"dm","outcome":"ok","detail":"","elapsed_ms":318}
+{"ts":"2026-06-08T05:23:02Z","user":"bob@example.com","cmd":"raise_hash_update","args":"main sub-utilities JIRA-100","source":"room","outcome":"error","detail":"SubmoduleAmbiguousError: 3 matches","elapsed_ms":612}
+```
 
 ---
 
@@ -394,6 +436,7 @@ part of the runtime.
 ├── webex_client.py              # Webex bot client + DM/room routing
 ├── jenkins_client.py            # Optional Jenkins API wrapper
 ├── user_store.py                # Encrypted per-user PAT store (Fernet)
+├── usage_logger.py              # Rotating JSONL logger of per-command usage (5MB cap, PATs redacted)
 ├── merge_users_db.py            # Merge two encrypted DBs (with PAT validation)
 ├── start_bot.sh                 # Activate venv + launch bot
 ├── sync_users_*.sh              # Multi-host user-store sync scripts

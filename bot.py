@@ -35,6 +35,7 @@ from github_client import (
     parse_pr_url,
 )  # SubmoduleAmbiguousError still imported \u2014 used by `raise_hash_update` to surface match list
 from jenkins_client import JenkinsClient, parse_jenkins_job_url
+from usage_logger import UsageLogger
 from user_store import UserStore
 from webex_client import WebexBotClient
 
@@ -170,8 +171,24 @@ class PRMonitorBot:
             self._jenkins = JenkinsClient(j_base, username=j_user or None, api_token=j_token)
             logger.info("Jenkins API client enabled (%s)", j_base)
 
+        # Per-command usage telemetry (5MB on-disk ceiling: 2 files × 2.5MB).
+        usage_log_path = os.environ.get(
+            "USAGE_LOG_PATH",
+            str(_bot_dir / "usage.log"),
+        )
+        self._usage_logger = UsageLogger(usage_log_path)
+        self._webex.set_usage_log_callback(self._usage_logger.log_command)
+        logger.info("Usage logger enabled at %s", usage_log_path)
+
         self._preload_gh_clients()
         self._register_commands()
+
+    def _is_admin(self, email: str) -> bool:
+        """True if ``email`` matches ``ADMIN_EMAIL`` (case-insensitive)."""
+        return bool(
+            self._admin_email
+            and (email or "").strip().lower() == self._admin_email
+        )
 
     def _preload_gh_clients(self) -> None:
         """Build GitHub clients for all registered users on startup."""
@@ -252,6 +269,8 @@ class PRMonitorBot:
             "raise_hash_update_for_all_sub_repos": self._cmd_raise_hash_update_for_all_sub_repos,
             "raise_hash_update_all": self._cmd_raise_hash_update_for_all_sub_repos,
             "backport": self._cmd_backport,
+            "usage_log": self._cmd_usage_log,
+            "usage": self._cmd_usage_log,
         }
         if self._jenkins is not None:
             all_cmds["jenkins_last"] = self._cmd_jenkins_last
@@ -751,6 +770,7 @@ class PRMonitorBot:
             "| **whoami** | `whoami` | Show your registration status |",
             "| **invite** `<username>` | `invite johndoe` | Invite a user via DM |",
             "| **users** | `users` | List registered users |",
+            "| **usage_log** | `usage_log` / `usage_log tail 50` / `usage_log all` / `usage_log <user@example.com>` | _(admin)_ Recent usage entries inline; `all` exports the full log as a file (5MB ring-buffer; PATs redacted) |",
             "| **interval** `<seconds>` | `interval 300` | Change polling interval |",
             "| **help** | `help` | Show this message |",
             "",
@@ -801,6 +821,165 @@ class PRMonitorBot:
             count = len(self._user_prs(e))
             lines.append(f"  \u2022 **{gh}** ({e}) — {count} PR(s) monitored")
         self._webex.send_room_message(markdown="\n".join(lines))
+
+    def _cmd_usage_log(self, sender_email: str, args: str) -> None:
+        """Admin-only: dump or summarize the per-command usage log.
+
+        Usage:
+            usage_log                       — last 100 entries inline
+            usage_log tail [N]              — last N entries (max 1000) inline
+            usage_log all                   — DM the full log as a file attachment
+            usage_log stats                 — summary (entries, bytes, by-cmd, by-user)
+            usage_log <user@example.com>    — filter to that user (full file)
+            usage_log user <user@example.com>  — same, explicit form
+        """
+        if not self._is_admin(sender_email):
+            self._webex.send_room_message(
+                markdown="\U0001F6AB `usage_log` is **admin-only**.",
+            )
+            return
+
+        raw = (args or "").strip()
+        lower = raw.lower()
+        user_filter: Optional[str] = None
+        mode = "tail"
+        n = 100
+
+        if not raw:
+            mode = "tail"
+        elif lower == "all":
+            mode = "all"
+        elif lower == "stats":
+            mode = "stats"
+        elif lower.startswith("tail"):
+            bits = raw.split()
+            if len(bits) > 1 and bits[1].isdigit():
+                n = max(1, min(1000, int(bits[1])))
+            mode = "tail"
+        elif lower.startswith("user "):
+            user_filter = raw.split(maxsplit=1)[1].strip().lower()
+            mode = "all"
+        elif "@" in raw and " " not in raw:
+            # Shorthand: `usage_log <email>` → filter that user, full export.
+            user_filter = raw.lower()
+            mode = "all"
+        else:
+            self._webex.send_room_message(
+                markdown=(
+                    "**Usage:**\n"
+                    "- `usage_log` — last 100 entries inline\n"
+                    "- `usage_log tail <N>` — last N entries inline (max 1000)\n"
+                    "- `usage_log all` — full log as a file attachment\n"
+                    "- `usage_log stats` — aggregate counts\n"
+                    "- `usage_log <user@example.com>` — full log filtered by user"
+                ),
+            )
+            return
+
+        if mode == "stats":
+            stats = self._usage_logger.summarize()
+            top_cmds = sorted(
+                stats["by_cmd"].items(), key=lambda kv: kv[1], reverse=True,
+            )[:15]
+            top_users = sorted(
+                stats["by_user"].items(), key=lambda kv: kv[1], reverse=True,
+            )[:15]
+            lines = [
+                "\U0001F4CA **Usage log stats**",
+                "",
+                f"- Entries: **{stats['entries']:,}**",
+                f"- Window: `{stats['first_ts'] or 'n/a'}` \u2192 `{stats['last_ts'] or 'n/a'}`",
+                f"- On-disk size: **{stats['size_bytes']:,} bytes**",
+                "",
+                "**Top commands:**",
+            ]
+            if top_cmds:
+                lines.append("| Command | Count | Errors |")
+                lines.append("|---------|------:|-------:|")
+                for cmd, count in top_cmds:
+                    errs = stats["errors_by_cmd"].get(cmd, 0)
+                    lines.append(f"| `{cmd}` | {count} | {errs} |")
+            else:
+                lines.append("_(no entries yet)_")
+            lines.append("")
+            lines.append("**Top users:**")
+            if top_users:
+                lines.append("| User | Count |")
+                lines.append("|------|------:|")
+                for user, count in top_users:
+                    lines.append(f"| `{user}` | {count} |")
+            else:
+                lines.append("_(none)_")
+            self._webex.send_dm(sender_email, markdown="\n".join(lines))
+            return
+
+        if mode == "tail":
+            lines = self._usage_logger.read_lines(max_lines=n, user=user_filter)
+            if not lines:
+                self._webex.send_dm(
+                    sender_email,
+                    markdown="_(no usage entries match)_",
+                )
+                return
+            body = "".join(lines)
+            limit = 6500  # leave headroom under Webex's ~7K markdown ceiling
+            if len(body) > limit:
+                body = body[-limit:]
+                # Trim partial first line if any
+                nl = body.find("\n")
+                if 0 < nl < 200:
+                    body = body[nl + 1:]
+                note = (
+                    f"_(truncated tail of last **{len(lines)}** entries; use "
+                    f"`usage_log all` for the full file)_"
+                )
+            else:
+                note = f"_(last **{len(lines)}** entries)_"
+            self._webex.send_dm(
+                sender_email,
+                markdown=note + "\n\n```\n" + body + "```",
+            )
+            return
+
+        # mode == "all" — export and DM as attachment
+        import tempfile
+        suffix = "_" + user_filter.split("@")[0] if user_filter else ""
+        fname = f"usage_log{suffix}.jsonl"
+        tmp_dir = tempfile.gettempdir()
+        tmp_path = Path(tmp_dir) / fname
+        try:
+            self._usage_logger.export_combined(tmp_path, user=user_filter)
+            try:
+                size = tmp_path.stat().st_size
+            except FileNotFoundError:
+                size = 0
+            if size == 0:
+                self._webex.send_dm(
+                    sender_email,
+                    markdown="_(no usage entries match)_",
+                )
+                return
+            md = (
+                "\U0001F4CA **Usage log export**"
+                + (f" (filtered by `{user_filter}`)" if user_filter else "")
+                + f" \u2014 {size:,} bytes"
+            )
+            ok = self._webex.send_dm_with_file(
+                sender_email,
+                file_path=tmp_path,
+                markdown=md,
+                file_name=fname,
+            )
+            if not ok:
+                self._webex.send_dm(
+                    sender_email,
+                    markdown="\u26A0\uFE0F Failed to send usage-log file. Check bot.log.",
+                )
+        finally:
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
 
 
     def _cmd_invite(self, sender_email: str, args: str) -> None:

@@ -7,13 +7,18 @@ Handlers receive (sender_email, args) for multi-user support.
 import logging
 import re
 import threading
-from typing import Callable, Dict, List, Optional, Set
+import time
+from typing import Any, Callable, Dict, List, Optional, Set
 
 import requests
 
 logger = logging.getLogger(__name__)
 
 WEBEX_API = "https://webexapis.com/v1"
+
+# Callback invoked once per dispatched command.
+# Signature: (sender_email, cmd, args, source, outcome, detail, elapsed_ms) -> None
+UsageLogCallback = Callable[[str, str, str, str, str, str, int], None]
 
 
 class WebexBotClient:
@@ -41,6 +46,7 @@ class WebexBotClient:
         self._reply_context = threading.local()
         self._seen_msg_ids: set = set()
         self._seen_max = 200
+        self._usage_log_cb: Optional[UsageLogCallback] = None
 
         me = self._session.get(f"{WEBEX_API}/people/me", timeout=15).json()
         self._bot_id = me.get("id")
@@ -111,6 +117,10 @@ class WebexBotClient:
         """Register a DM-only command. Handler signature: handler(sender_email, args)."""
         self._dm_commands[name.lower()] = handler
 
+    def set_usage_log_callback(self, cb: Optional[UsageLogCallback]) -> None:
+        """Register a callback fired once per dispatched command for usage telemetry."""
+        self._usage_log_cb = cb
+
     @property
     def reply_source(self) -> Optional[str]:
         """Return 'room' or 'dm' depending on where the current command originated, or None."""
@@ -169,6 +179,51 @@ class WebexBotClient:
             return True
         except Exception:
             logger.exception("Failed to send DM to %s", email)
+            return False
+
+    def send_dm_with_file(
+        self,
+        email: str,
+        file_path: Any,
+        markdown: str = "",
+        text: str = "",
+        file_name: Optional[str] = None,
+        content_type: str = "application/octet-stream",
+        timeout: int = 60,
+    ) -> bool:
+        """Send a DM with a file attachment via multipart/form-data.
+
+        The shared session has a ``Content-Type: application/json`` header
+        baked in (used by all the JSON endpoints), which would break
+        multipart uploads — so this method issues a fresh request with only
+        the ``Authorization`` header, letting ``requests`` set the boundary.
+        """
+        from pathlib import Path as _Path
+        path = _Path(file_path)
+        name = file_name or path.name
+        auth = self._session.headers.get("Authorization", "")
+        if not auth:
+            logger.error("send_dm_with_file: missing Authorization header")
+            return False
+        try:
+            data: Dict[str, str] = {"toPersonEmail": email}
+            if markdown:
+                data["markdown"] = markdown
+            elif text:
+                data["text"] = text
+            with open(path, "rb") as fh:
+                files = {"files": (name, fh, content_type)}
+                resp = requests.post(
+                    f"{WEBEX_API}/messages",
+                    headers={"Authorization": auth},
+                    data=data,
+                    files=files,
+                    timeout=timeout,
+                )
+            resp.raise_for_status()
+            return True
+        except Exception:
+            logger.exception("Failed to send DM file to %s (path=%s)", email, path)
             return False
 
     def lookup_person(self, email: str) -> Optional[str]:
@@ -372,20 +427,67 @@ class WebexBotClient:
         return text
 
     def _dispatch_one(self, sender_email: str, text: str, commands: dict) -> None:
-        """Dispatch a single command string against a command table."""
+        """Dispatch a single command string against a command table.
+
+        Captures outcome + elapsed time and invokes the usage-log callback
+        (if registered). Per-segment exceptions are caught here so one bad
+        segment does not abort sibling segments in a multi-segment message.
+        """
         parts = text.split(maxsplit=1)
         cmd = parts[0].lower().lstrip("/")
         args = parts[1] if len(parts) > 1 else ""
+        source = getattr(self._reply_context, "source", None) or "?"
 
         handler = commands.get(cmd)
-        if handler:
-            logger.info("Dispatching cmd=%r sender=%s args=%r", cmd, sender_email, args)
-            handler(sender_email, args)
-        else:
+        if handler is None:
             logger.warning("No handler for cmd=%r (text=%r)", cmd, text)
             self.send_room_message(
                 markdown="Unknown command: **{}**. Type **help** for available commands.".format(cmd)
             )
+            self._emit_usage(sender_email, cmd, args, source, "unknown", "", 0)
+            return
+
+        # Args are deliberately NOT echoed in the dispatch log line for
+        # commands like `register`/`renew` — the bot's general logger has
+        # always logged args; usage_logger redacts on its own.
+        log_args = "<redacted>" if cmd in ("register", "renew", "renew_token") else args
+        logger.info("Dispatching cmd=%r sender=%s args=%r", cmd, sender_email, log_args)
+
+        started = time.monotonic()
+        outcome = "ok"
+        detail = ""
+        try:
+            handler(sender_email, args)
+        except Exception as exc:
+            outcome = "error"
+            detail = "{}: {}".format(type(exc).__name__, str(exc)[:120])
+            logger.exception("Handler error for cmd=%r", cmd)
+            try:
+                self.send_room_message(
+                    text="Error executing command **{}**.".format(cmd)
+                )
+            except Exception:
+                pass
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        self._emit_usage(sender_email, cmd, args, source, outcome, detail, elapsed_ms)
+
+    def _emit_usage(
+        self,
+        sender_email: str,
+        cmd: str,
+        args: str,
+        source: str,
+        outcome: str,
+        detail: str,
+        elapsed_ms: int,
+    ) -> None:
+        cb = self._usage_log_cb
+        if cb is None:
+            return
+        try:
+            cb(sender_email, cmd, args, source, outcome, detail, elapsed_ms)
+        except Exception:
+            logger.exception("usage log callback raised; ignoring")
 
     def _handle_room_message(self, sender_email: str, message: dict) -> None:
         text = (message.get("text") or "").strip()
