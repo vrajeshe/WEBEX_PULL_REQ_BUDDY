@@ -319,6 +319,31 @@ Anyone other than `ADMIN_EMAIL` calling `usage_log` gets a `🚫 admin-only` rep
 
 ---
 
+### Branch resolution and drift detection
+
+`raise_hash_update` (and `raise_hash_update_for_all_sub_repos`) treats the
+`branch =` field in `.gitmodules` as the **declarative source of truth**
+for which branch each submodule tracks.
+
+- When `.gitmodules` declares a branch for a submodule, the bot **always**
+  bumps to the tip of *that* branch, even if the currently pinned gitlink
+  SHA does not appear in that branch's history. This is the correct
+  behaviour for "fix the gitlink back to what `.gitmodules` says".
+- If the current gitlink SHA is **not** an ancestor of the declared branch's
+  tip — i.e. someone has manually committed a SHA from a *different*
+  branch into the parent gitlink — the bot flags this as **branch drift**
+  and surfaces a prominent warning in both the PR body (notes column + a
+  blockquote) and the Webex reply. The PR itself *corrects* the drift by
+  resetting the gitlink onto the declared branch.
+- If `.gitmodules` declares a branch that does not exist on the submodule
+  remote, the bot surfaces a clear error rather than silently drifting to
+  a default branch.
+
+When `.gitmodules` has no `branch =` for a submodule, the bot falls back
+to the legacy heuristic: try the submodule's default branch, the parent's
+target branch, `master`/`main`, then a paginated list of remote branches,
+and pick the first whose tip is descended from the current gitlink SHA.
+
 ## Backports
 
 ```

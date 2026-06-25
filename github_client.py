@@ -75,7 +75,14 @@ _PRECOMMIT_PARAMS_HDR_RE = re.compile(
 
 
 class SubmoduleBumpRow(NamedTuple):
-    """One submodule bump target after resolving ``.gitmodules`` and tip SHAs."""
+    """One submodule bump target after resolving ``.gitmodules`` and tip SHAs.
+
+    ``branch_drift`` is ``True`` when ``.gitmodules`` declares a ``branch =``
+    *and* the current gitlink SHA is **not** part of that branch's history
+    on the submodule remote. That is the signature of a rogue manual commit
+    that pinned a SHA from a different branch into the parent gitlink — the
+    bump PR is *correcting* that drift back onto the declared branch.
+    """
 
     sub_path: str
     sub_owner: str
@@ -84,6 +91,7 @@ class SubmoduleBumpRow(NamedTuple):
     current_sha: str
     src_branch: str
     tip_sha: str
+    branch_drift: bool = False
 
 
 class SubmoduleAmbiguousError(Exception):
@@ -1246,17 +1254,66 @@ class GitHubEnterpriseClient:
         parent_target_branch: str,
         gitmodules_branch: Optional[str] = None,
         max_branch_pages: int = 3,
-    ) -> Tuple[str, str]:
-        """Pick a branch whose tip contains ``current_sha``; return ``(branch_name, tip_sha)``.
+    ) -> Tuple[str, str, bool]:
+        """Pick the source branch to bump to; return ``(branch_name, tip_sha, branch_drift)``.
 
-        If ``gitmodules_branch`` is set (``branch =`` in ``.gitmodules`` for this submodule),
-        it is tried **first** so the bump tracks the same remote branch as the parent checkout.
+        Resolution policy:
+
+        - When ``.gitmodules`` declares ``branch =`` for this submodule
+          (``gitmodules_branch`` is non-empty), that branch is the
+          **declarative source of truth**. The function returns its tip
+          unconditionally. If the current gitlink ``current_sha`` is *not*
+          contained in that branch's history (i.e. someone manually pinned
+          a SHA from a different branch into the parent gitlink),
+          ``branch_drift`` is set to ``True`` so callers can flag that the
+          bump PR is *correcting* a corrupted gitlink rather than tracking
+          the legitimate tip-advance of the same branch.
+          If the declared branch does not exist on the submodule remote,
+          a :class:`ValueError` is raised — silently drifting to a default
+          branch would mask the ``.gitmodules`` error.
+
+        - When ``.gitmodules`` has no ``branch =``, fall back to the legacy
+          heuristic: walk the default branch, the parent's target branch,
+          ``master`` / ``main``, and then a paginated list of all remote
+          branches, returning the first whose tip is equal to or descended
+          from ``current_sha``. ``branch_drift`` stays ``False`` because
+          there is no declarative source of truth to drift from.
+
+        Without this short-circuit, a rogue gitlink (a SHA committed from
+        the *wrong* remote branch) would steer the bot off the declared
+        branch and onto whatever branch happens to contain that rogue SHA,
+        permanently amplifying the corruption on every subsequent bump.
         """
+        gm = (gitmodules_branch or "").strip()
+
+        if gm:
+            try:
+                tip = self.get_branch_tip_sha(sub_owner, sub_repo, gm)
+            except requests.exceptions.HTTPError as exc:
+                if getattr(exc.response, "status_code", None) == 404:
+                    raise ValueError(
+                        f"`.gitmodules` declares `branch = {gm}` for "
+                        f"`{sub_owner}/{sub_repo}` but that branch does not "
+                        f"exist on the submodule remote. Fix `.gitmodules` "
+                        f"(or create/push the branch) and retry."
+                    ) from exc
+                raise
+            drift = False
+            if tip != (current_sha or "").lower() and tip != current_sha:
+                try:
+                    drift = not self.commit_is_ancestor_of_tip(
+                        sub_owner, sub_repo, current_sha, tip
+                    )
+                except requests.exceptions.HTTPError:
+                    # `compare` can 404 if current_sha is unknown on the
+                    # submodule remote (rebased away, force-pushed, or
+                    # never pushed) — that itself is a strong drift signal.
+                    drift = True
+            return gm, tip, drift
+
+        # No `.gitmodules` branch hint — fall back to the legacy heuristic.
         default_br = self.get_repo_default_branch(sub_owner, sub_repo)
         candidates: List[str] = []
-        gm = (gitmodules_branch or "").strip()
-        if gm:
-            candidates.append(gm)
         for b in (default_br, parent_target_branch, "master", "main"):
             if b and b not in candidates:
                 candidates.append(b)
@@ -1287,12 +1344,17 @@ class GitHubEnterpriseClient:
             except requests.exceptions.HTTPError:
                 continue
             if tip == current_sha:
-                return br_name, tip
-            if self.commit_is_ancestor_of_tip(sub_owner, sub_repo, current_sha, tip):
-                return br_name, tip
+                return br_name, tip, False
+            try:
+                if self.commit_is_ancestor_of_tip(
+                    sub_owner, sub_repo, current_sha, tip
+                ):
+                    return br_name, tip, False
+            except requests.exceptions.HTTPError:
+                continue
 
         tip = self.get_branch_tip_sha(sub_owner, sub_repo, default_br)
-        return default_br, tip
+        return default_br, tip, False
 
     @staticmethod
     def _is_duplicate_open_pull_422(exc: requests.exceptions.HTTPError) -> bool:
@@ -1451,7 +1513,7 @@ class GitHubEnterpriseClient:
         current_sha = self.get_submodule_gitlink_sha(
             parent_owner, parent_repo, sub_path, target_branch
         )
-        src_branch, tip_sha = self.find_submodule_source_branch(
+        src_branch, tip_sha, branch_drift = self.find_submodule_source_branch(
             sub_owner,
             sub_repo,
             current_sha,
@@ -1470,6 +1532,7 @@ class GitHubEnterpriseClient:
             current_sha=current_sha,
             src_branch=src_branch,
             tip_sha=tip_sha,
+            branch_drift=branch_drift,
         )
 
     def _submodule_bump_row_from_path(
@@ -1826,6 +1889,7 @@ class GitHubEnterpriseClient:
         if len(title) > 240:
             title = title[:237] + "..."
 
+        drift_rows = [r for r in rows if r.branch_drift]
         if multi:
             web_base = self._base_url.replace("/api/v3", "")
 
@@ -1837,11 +1901,16 @@ class GitHubEnterpriseClient:
             pr_body = (
                 f"### Submodule update ({len(rows)} submodules)\n\n"
                 f"- **Parent:** `{parent_owner}/{parent_repo}` \u2192 `{target_branch}`\n\n"
-                "| # | Submodule path | Repo | `.gitmodules` branch | Source branch | Previous SHA | New SHA |\n"
-                "|---|---|---|---|---|---|---|\n"
+                "| # | Submodule path | Repo | `.gitmodules` branch | Source branch | Previous SHA | New SHA | Notes |\n"
+                "|---|---|---|---|---|---|---|---|\n"
             )
             for idx, r in enumerate(rows, start=1):
                 gm_b = (r.gitmodules_branch or "").strip() or "_(none)_"
+                notes = (
+                    "\u26A0\uFE0F **drift** \u2014 previous SHA was not on declared branch"
+                    if r.branch_drift
+                    else ""
+                )
                 pr_body += (
                     f"| {idx} "
                     f"| `{r.sub_path}` "
@@ -1849,7 +1918,8 @@ class GitHubEnterpriseClient:
                     f"| `{gm_b}` "
                     f"| `{r.src_branch}` "
                     f"| {_commit_link(r.sub_owner, r.sub_repo, r.current_sha)} "
-                    f"| {_commit_link(r.sub_owner, r.sub_repo, r.tip_sha)} |\n"
+                    f"| {_commit_link(r.sub_owner, r.sub_repo, r.tip_sha)} "
+                    f"| {notes} |\n"
                 )
             pr_body += "\n"
             if frr_mk_updated and frr_tip_sha:
@@ -1862,7 +1932,7 @@ class GitHubEnterpriseClient:
             if (r.gitmodules_branch or "").strip():
                 gm_line = (
                     f"- **`.gitmodules` `branch`:** `{r.gitmodules_branch}` "
-                    f"(used first to resolve submodule tip)\n"
+                    f"(declarative source of truth)\n"
                 )
             pr_body = (
                 f"### Submodule update\n\n"
@@ -1879,6 +1949,25 @@ class GitHubEnterpriseClient:
                     f"- **`rules/frr.mk`:** `FRR_TAG` set to `{r.tip_sha}` "
                     f"(same as submodule gitlink)\n"
                 )
+
+        if drift_rows:
+            pr_body += (
+                "\n> \u26A0\uFE0F **Branch drift detected and being corrected**\n>\n"
+                "> "
+                f"{len(drift_rows)} of {len(rows)} submodule(s) had a previous "
+                "gitlink SHA that does **not** belong to the branch declared "
+                "in `.gitmodules` \u2014 i.e. a SHA from a different branch had "
+                "been manually pinned into the parent gitlink. This PR resets "
+                "each of those gitlinks back onto the tip of the `.gitmodules` "
+                "branch (the declarative source of truth):\n>\n"
+            )
+            for r in drift_rows:
+                pr_body += (
+                    f"> - `{r.sub_path}` \u2192 reset to tip of "
+                    f"`{r.src_branch}` (was `{(r.current_sha or '')[:10]}`, "
+                    f"not in `{r.src_branch}` history).\n"
+                )
+
         pr_body += f"\nTracking: **{jira_no}**"
 
         pr_description = self._compose_raise_hash_pr_description(
@@ -1940,12 +2029,22 @@ class GitHubEnterpriseClient:
                 )
 
         first = rows[0]
-        webex_lines = [
-            f"  - `{r.sub_path}` (`{r.sub_owner}/{r.sub_repo}`): "
-            f"`{r.current_sha[:7]}` \u2192 `{r.tip_sha[:7]}` (`{r.src_branch}`)"
-            for r in rows
-        ]
+        webex_lines = []
+        for r in rows:
+            drift_tag = " \u26A0\uFE0F drift" if r.branch_drift else ""
+            webex_lines.append(
+                f"  - `{r.sub_path}` (`{r.sub_owner}/{r.sub_repo}`): "
+                f"`{r.current_sha[:7]}` \u2192 `{r.tip_sha[:7]}` "
+                f"(`{r.src_branch}`){drift_tag}"
+            )
         webex_submodules_md = "**Submodule(s):**\n" + "\n".join(webex_lines)
+        if drift_rows:
+            webex_submodules_md += (
+                f"\n\n\u26A0\uFE0F **{len(drift_rows)} of {len(rows)} submodule(s) had "
+                f"branch drift** \u2014 their previous gitlink SHA did not belong to the "
+                f"`.gitmodules` branch. This PR resets each onto the declared branch tip "
+                f"(see the PR body for details)."
+            )
 
         return {
             "html_url": pr.get("html_url", ""),
@@ -1961,6 +2060,8 @@ class GitHubEnterpriseClient:
             "multi": "1" if multi else "",
             "sub_repos": ",".join(sorted({r.sub_repo for r in rows})),
             "sub_paths": ",".join(r.sub_path for r in rows),
+            "drift_count": str(len(drift_rows)),
+            "drift_paths": ",".join(r.sub_path for r in drift_rows),
             "webex_submodules_md": webex_submodules_md,
         }
 
