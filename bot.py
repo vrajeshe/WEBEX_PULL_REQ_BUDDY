@@ -154,7 +154,7 @@ class PRMonitorBot:
         self._poll_interval = int(os.environ.get("POLL_INTERVAL_SECONDS", "600"))
         _dr = os.environ.get("DEFAULT_REPO", "").strip()
         if _dr and "/" not in _dr:
-            self._default_repo = f"myorg/{_dr}"
+            self._default_repo = f"whitebox/{_dr}"
         else:
             self._default_repo = _dr
         self._admin_email = admin_email
@@ -303,14 +303,14 @@ class PRMonitorBot:
     def _resolve_parent_owner_repo(self, spec: Optional[str]) -> Optional[Tuple[str, str]]:
         """Resolve parent repo as (owner, repo).
 
-        Bare `repo` (no slash) is always **myorg/repo**. Full `owner/repo` is used as-is.
+        Bare `repo` (no slash) is always **whitebox/repo**. Full `owner/repo` is used as-is.
         """
         if spec:
             s = spec.strip()
             if "/" in s:
                 owner, repo = s.split("/", 1)
                 return owner.strip(), repo.strip()
-            return "myorg", s
+            return "whitebox", s
         if self._default_repo:
             o, r = self._default_repo.split("/", 1)
             return o, r
@@ -559,44 +559,84 @@ class PRMonitorBot:
         self._gh_clients[sender_email] = test_gh
         return gh_user
 
-    def _dm_register(self, sender_email: str, args: str) -> None:
-        if self._webex.reply_source == "room":
-            self._webex.send_room_message(
-                markdown=(
-                    "\U0001F44B To register, just send me a **direct message** (DM) with:\n\n"
-                    "`register <YOUR_GITHUB_TOKEN>`\n\n"
-                    "\U0001F512 **Your token is safe** — it is encrypted with AES-256 "
-                    "and stored securely. It is only used for GitHub API calls on your behalf "
-                    "and is never visible to anyone.\n\n"
-                    "Need a token? Go to "
-                    "[Tokens (classic)](https://github.example.com/settings/tokens)"
-                )
+    def _warn_room_pat_leak(self, sender_email: str, cmd_name: str) -> None:
+        """Post a room-visible warning that ``sender_email`` just pasted a PAT in the room.
+
+        Called whenever ``register`` / ``renew`` is invoked in the shared room *with*
+        a token argument. Silently redirecting to DM at this point does not un-expose
+        the token — it just leaves the user stuck and repeatedly re-pasting it, which
+        makes the leak worse. This warning surfaces the exposure to the user (and to
+        anyone else in the room) so the token can be rotated immediately.
+        """
+        self._webex.send_broadcast(
+            markdown=(
+                f"\u26A0\uFE0F **{sender_email}** \u2014 you just pasted a "
+                f"**GitHub Personal Access Token** in this shared room via "
+                f"`{cmd_name}`. It is now visible in this room's history to "
+                f"**everyone**.\n\n"
+                f"**Please rotate this token immediately** on "
+                f"[Tokens (classic)](https://github.example.com/settings/tokens) "
+                f"and, next time, **send `{cmd_name} <TOKEN>` to me via DM** \u2014 "
+                f"never in the room.\n\n"
+                f"_(The bot has captured the token so your registration is not "
+                f"stuck, but treat it as compromised until you rotate.)_"
             )
+        )
+
+    def _dm_register(self, sender_email: str, args: str) -> None:
+        token = args.strip()
+        in_room = (self._webex.reply_source == "room")
+
+        # Empty command: just guidance. Send to whichever channel the user
+        # is actually looking at so they don't miss it.
+        if not token:
+            guidance = (
+                "\U0001F44B To register, DM me:\n\n"
+                "`register <YOUR_GITHUB_PERSONAL_ACCESS_TOKEN>`\n\n"
+                "\U0001F512 Your token is encrypted with AES-256 at rest and is "
+                "only used for GitHub API calls on your behalf.\n\n"
+                "Need a token? Go to "
+                "[Tokens (classic)](https://github.example.com/settings/tokens)"
+            )
+            if in_room:
+                self._webex.send_broadcast(
+                    markdown=(
+                        f"\U0001F44B **{sender_email}** \u2014 please **DM me** "
+                        f"with `register <YOUR_GITHUB_TOKEN>`. Do **not** paste "
+                        f"tokens in this public room."
+                    )
+                )
+            self._webex.send_dm(sender_email, markdown=guidance)
             return
 
-        token = args.strip()
-        if not token:
-            self._webex.send_dm(
-                sender_email,
-                markdown=(
-                    "\U0001F44B Just paste your token here:\n\n"
-                    "`register <YOUR_GITHUB_PERSONAL_ACCESS_TOKEN>`\n\n"
-                    "\U0001F512 **Your token is safe** \u2014 it is encrypted with AES-256 "
-                    "and stored securely. It is only used for GitHub API calls on your behalf "
-                    "and is never visible to anyone (not even the bot admin).\n\n"
-                    "Need a token? Go to "
-                    "[Tokens (classic)](https://github.example.com/settings/tokens)"
-                ),
-            )
-            return
+        # Token was pasted in the room \u2014 it is already leaked. Warn loudly
+        # in the room, then fall through and process the registration so the
+        # user isn't stuck retrying (which just leaks the same token again).
+        if in_room:
+            self._warn_room_pat_leak(sender_email, "register")
 
         prior = self._user_store.get(sender_email)
         gh_user = self._validate_and_store_github_pat(sender_email, token)
         if gh_user is None:
-            self._webex.send_dm(
-                sender_email,
-                markdown="\u274C **Invalid token.** Could not authenticate with GitHub. Check your PAT.",
+            err = (
+                "\u274C **Invalid token.** GitHub rejected this PAT \u2014 "
+                "nothing was changed.\n\n"
+                "Common causes:\n"
+                "- Token **expired** \u2014 generate a new one at "
+                "[Tokens (classic)](https://github.example.com/settings/tokens)\n"
+                "- Missing **SSO authorization** for the enterprise org (click "
+                "\u201CAuthorize\u201D next to the token on GitHub Enterprise)\n"
+                "- Wrong host (this bot talks to **GitHub Enterprise**, not github.com)"
             )
+            self._webex.send_dm(sender_email, markdown=err)
+            if in_room:
+                self._webex.send_broadcast(
+                    markdown=(
+                        f"\u274C **{sender_email}** \u2014 that token was "
+                        f"rejected by GitHub. See your DM for details. "
+                        f"**Still rotate it** since it was leaked in the room."
+                    )
+                )
             return
 
         if prior is None:
@@ -607,7 +647,8 @@ class PRMonitorBot:
                     f"\u2705 **Registered!** GitHub user: **{gh_user}**\n\n"
                     f"You can now use all commands in the **room** or via **DM**.\n"
                     f"All responses are sent privately to you via DM.\n"
-                    f"If your PAT **expires** later, DM: `renew <NEW_TOKEN>` (same as re-sending `register`).\n"
+                    f"If your PAT **expires** later, DM: `renew <NEW_TOKEN>` "
+                    f"(same as re-sending `register`).\n"
                     f"Type `unregister` here to remove your credentials."
                 ),
             )
@@ -620,43 +661,56 @@ class PRMonitorBot:
                 sender_email,
                 markdown=(
                     f"\u2705 **GitHub token updated** for **{gh_user}**.\n\n"
-                    f"Your previous PAT was replaced. Retry any command that returned **401** / **Unauthorized**.\n"
-                    f"If org repos still fail, authorize **SSO** for your token on GitHub Enterprise."
+                    f"Your previous PAT was replaced. Retry any command that "
+                    f"returned **401** / **Unauthorized**.\n"
+                    f"If org repos still fail, authorize **SSO** for your token "
+                    f"on GitHub Enterprise."
                 ),
             )
 
     def _dm_renew(self, sender_email: str, args: str) -> None:
-        """DM-only: replace stored PAT (e.g. after expiry) without unregistering."""
-        if self._webex.reply_source == "room":
-            self._webex.send_room_message(
-                markdown=(
-                    "\U0001F44B To **renew** an expired GitHub PAT, send me a **DM**:\n\n"
-                    "`renew <YOUR_NEW_GITHUB_TOKEN>`\n\n"
-                    "Same as `register` if you already have an account — updates the stored token only."
-                )
+        """Replace stored PAT (e.g. after expiry) without unregistering.
+
+        Accepts both DM and room invocations. When invoked in the room *with*
+        a token, the token is treated as leaked \u2014 the bot issues a loud
+        room-visible warning telling the user to rotate immediately, and
+        still processes the renewal so the user isn't stuck retrying.
+        """
+        token = args.strip()
+        in_room = (self._webex.reply_source == "room")
+
+        if not token:
+            usage = (
+                "**Usage:** `renew <NEW_GITHUB_PERSONAL_ACCESS_TOKEN>`\n\n"
+                "Use this when your PAT **expired** or you need a **new scope** "
+                "(e.g. SSO). Your Webex identity stays the same; only the "
+                "GitHub token is replaced.\n\n"
+                "You can also send `register <NEW_TOKEN>` \u2014 it does the "
+                "same update if you are already registered.\n\n"
+                "\u26A0\uFE0F Send this command via **DM**, not in a room."
             )
+            if in_room:
+                self._webex.send_broadcast(
+                    markdown=(
+                        f"\U0001F44B **{sender_email}** \u2014 please **DM me** "
+                        f"with `renew <NEW_TOKEN>`. Do **not** paste tokens in "
+                        f"the room."
+                    )
+                )
+            self._webex.send_dm(sender_email, markdown=usage)
             return
 
-        token = args.strip()
-        if not token:
-            self._webex.send_dm(
-                sender_email,
-                markdown=(
-                    "**Usage:** `renew <NEW_GITHUB_PERSONAL_ACCESS_TOKEN>`\n\n"
-                    "Use this when your PAT **expired** or you need a **new scope** (e.g. SSO). "
-                    "Your Webex identity stays the same; only the GitHub token is replaced.\n\n"
-                    "You can also send `register <NEW_TOKEN>` — it does the same update if you are already registered."
-                ),
-            )
-            return
+        if in_room:
+            self._warn_room_pat_leak(sender_email, "renew")
 
         if not self._user_store.get(sender_email):
             self._webex.send_dm(
                 sender_email,
                 markdown=(
                     "You are **not** registered yet. Send:\n\n"
-                    "`register <YOUR_GITHUB_TOKEN>`\n\n"
-                    "After that, use `renew <NEW_TOKEN>` whenever you need to rotate the PAT."
+                    "`register <YOUR_GITHUB_TOKEN>` (via DM)\n\n"
+                    "After that, use `renew <NEW_TOKEN>` whenever you need to "
+                    "rotate the PAT."
                 ),
             )
             return
@@ -665,8 +719,21 @@ class PRMonitorBot:
         if gh_user is None:
             self._webex.send_dm(
                 sender_email,
-                markdown="\u274C **Invalid token.** GitHub rejected this PAT — nothing was changed.",
+                markdown=(
+                    "\u274C **Invalid token.** GitHub rejected this PAT \u2014 "
+                    "nothing was changed.\n\n"
+                    "Check that the token is **not expired**, has **SSO "
+                    "authorized** for the org, and was copied in full."
+                ),
             )
+            if in_room:
+                self._webex.send_broadcast(
+                    markdown=(
+                        f"\u274C **{sender_email}** \u2014 that token was "
+                        f"rejected by GitHub. See your DM for details. "
+                        f"**Still rotate it** since it was leaked in the room."
+                    )
+                )
             return
 
         logger.info("GitHub PAT renewed (renew cmd) for %s (%s)", sender_email, gh_user)
@@ -674,7 +741,8 @@ class PRMonitorBot:
             sender_email,
             markdown=(
                 f"\u2705 **GitHub token renewed** for **{gh_user}**.\n\n"
-                f"Retry your PR commands. If you still see **401**, check **SSO authorization** for the org on "
+                f"Retry your PR commands. If you still see **401**, check "
+                f"**SSO authorization** for the org on "
                 f"[token settings](https://github.example.com/settings/tokens)."
             ),
         )
@@ -757,8 +825,8 @@ class PRMonitorBot:
             "| **automerge** `<PR_ID> <on/off>` | `automerge 3473 on` or full URL | Turns **GitHub** auto-merge on/off immediately |",
             "| **notify** `<PR_ID> <user>` | `notify 3473 johndoe` or full URL | Add status subscriber |",
             "| **unnotify** `<PR_ID> <user>` | `unnotify 3473 johndoe` or full URL | Remove subscriber |",
-            "| **raise_hash_update** | `raise_hash_update main sonic-mgmt-common,sonic-swss JIRA-1` | **parent_ref**; **`sub`** = `.gitmodules` hint(s); **commas** = **one PR** updating each gitlink; **FRR** sets **`rules/frr.mk`** |",
-            "| **raise_hash_update_for_all_sub_repos** | `raise_hash_update_for_all_sub_repos main JIRA-1` | Bumps **every stale** submodule on the parent in **one PR** (skips up-to-date and unreachable ones) |",
+            "| **raise_hash_update** | `raise_hash_update c-master sonic-mgmt-common,sonic-swss JIRA-1` | **parent_ref**; **`sub`** = `.gitmodules` hint(s); **commas** = **one PR** updating each gitlink; **FRR** sets **`rules/frr.mk`** |",
+            "| **raise_hash_update_for_all_sub_repos** | `raise_hash_update_for_all_sub_repos c-master JIRA-1` | Bumps **every stale** submodule on the parent in **one PR** (skips up-to-date and unreachable ones) |",
         ]
         if self._jenkins is not None:
             help_lines.extend([
@@ -784,7 +852,7 @@ class PRMonitorBot:
             "- Merged/closed PRs are auto-stopped",
             "- Status reports every 3 hours (only if something changed)",
             "- **raise_hash_update** — **parent_ref** reads **.gitmodules** on the parent; **sub** is a hint per submodule (comma-separated \u2192 **one PR** updating every listed gitlink). Each hint must resolve uniquely (refine with `path/` or `owner/repo` if ambiguous). **FRR** also updates **`rules/frr.mk`**.\n",
-            "- Examples: `raise_hash_update 202405c sonic-utilities JIRA-39128`; `raise_hash_update main frr JIRA-39128`; `raise_hash_update main sonic-mgmt-common,sonic-swss JIRA-35315`.",
+            "- Examples: `raise_hash_update 202405c sonic-utilities MIGSOFTWAR-39128`; `raise_hash_update c-master frr MIGSOFTWAR-39128`; `raise_hash_update c-master sonic-mgmt-common,sonic-swss MIGSOFTWAR-35315`.",
             "",
             "All commands work in the **room** or **DM**. Commands are **case insensitive**.",
         ])
@@ -990,7 +1058,7 @@ class PRMonitorBot:
             )
             return
 
-        email = f"{username}@example.com"
+        email = f"{username}@cisco.com"
         rec = self._user_store.get(email)
         if rec:
             self._webex.send_room_message(
@@ -1356,7 +1424,7 @@ class PRMonitorBot:
                     "Conflicts are reported back so you can resolve manually \u2014 the bot won't "
                     "guess. The original PR's `base` does not need to equal **target_branch**.\n\n"
                     "**Example:**\n"
-                    "`backport https://github.example.com/myorg/sub-dhcp-relay/pull/40 main`"
+                    "`backport https://github.example.com/whitebox/sonic-dhcp-relay/pull/40 c-master`"
                 ),
             )
             return
@@ -1437,7 +1505,7 @@ class PRMonitorBot:
                 markdown=(
                     "**Usage:** `jenkins_last <job URL or job/path>`\n\n"
                     "**Examples:**\n"
-                    "`jenkins_last https://jenkins.example.com/job/Update_Golden_Code/`\n"
+                    "`jenkins_last https://jenkins-sonic.cisco.com/job/Update_Golden_Code/`\n"
                     "`jenkins_last Update_Golden_Code`"
                 ),
             )
@@ -1501,7 +1569,7 @@ class PRMonitorBot:
                     "With no **KEY=VAL** pairs, queues a plain **build**. With parameters, uses "
                     "**buildWithParameters**.\n\n"
                     "**Examples:**\n"
-                    "`jenkins_build https://jenkins.example.com/job/Update_Golden_Code/`\n"
+                    "`jenkins_build https://jenkins-sonic.cisco.com/job/Update_Golden_Code/`\n"
                     "`jenkins_build Update_Golden_Code BRANCH=202405c`"
                 ),
             )
@@ -1600,7 +1668,7 @@ class PRMonitorBot:
             "(If an open PR already used this **head**→**base**, the bot **reuses** it after updating the branch. "
             "The bot also **resets** the bump **head** ref if GitHub says it already exists.)\n\n"
             "Confirm **parent**, **target_branch**, and **sub** hint; ensure your token matches the "
-            "GitHub user that is allowed to push to **myorg/buildimage** (or whichever parent you passed)."
+            "GitHub user that is allowed to push to **whitebox/sonic-buildimage** (or whichever parent you passed)."
         )
 
     def _cmd_raise_hash_update(self, sender_email: str, args: str) -> None:
@@ -1612,12 +1680,12 @@ class PRMonitorBot:
                 markdown=(
                     "**Usage:** `raise_hash_update <parent_ref> <sub> <Jira_No> [parent_owner/parent_repo]`\n\n"
                     "**Examples:**\n"
-                    "`raise_hash_update 202405c sonic-utilities JIRA-39128`  _(release ref **202405c** on parent)_\n"
-                    "`raise_hash_update main frr JIRA-39128`  _(FRR on **main**; updates **rules/frr.mk**)_\n"
-                    "`raise_hash_update main sonic-mgmt-common,sonic-swss JIRA-35315`  "
+                    "`raise_hash_update 202405c sonic-utilities MIGSOFTWAR-39128`  _(release ref **202405c** on parent)_\n"
+                    "`raise_hash_update c-master frr MIGSOFTWAR-39128`  _(FRR on **c-master**; updates **rules/frr.mk**)_\n"
+                    "`raise_hash_update c-master sonic-mgmt-common,sonic-swss MIGSOFTWAR-35315`  "
                     "_(comma-separated **sub** hints \u2192 **one PR** with each submodule gitlink updated)_\n"
-                    "`raise_hash_update master sonic-utilities JIRA-12345`\n\n"
-                    "- **parent_ref** — branch or tag on **buildimage** (first reads `.gitmodules` / gitlinks there; PR **base**).\n"
+                    "`raise_hash_update master sonic-utilities CSCwj12345`\n\n"
+                    "- **parent_ref** — branch or tag on **sonic-buildimage** (first reads `.gitmodules` / gitlinks there; PR **base**).\n"
                     "- **sub** — hint from **`.gitmodules`**: `frr`, path suffix, `owner/repo`, etc. "
                     "Use **commas** to bump **several** submodules in **one** commit/PR (each hint must resolve uniquely).\n"
                     "- Submodule **tip** — uses **`.gitmodules` `branch =`** for that entry **first** (all submodules), "
@@ -1742,8 +1810,8 @@ class PRMonitorBot:
                     "- For **FRR**, **`rules/frr.mk`** is also updated (same as `raise_hash_update`).\n"
                     "- **parent** defaults to `DEFAULT_REPO` if omitted.\n\n"
                     "**Examples:**\n"
-                    "`raise_hash_update_for_all_sub_repos main JIRA-39128`\n"
-                    "`raise_hash_update_for_all_sub_repos 202405c JIRA-39128 myorg/buildimage`"
+                    "`raise_hash_update_for_all_sub_repos c-master MIGSOFTWAR-39128`\n"
+                    "`raise_hash_update_for_all_sub_repos 202405c MIGSOFTWAR-39128 whitebox/sonic-buildimage`"
                 ),
             )
             return
@@ -2077,7 +2145,7 @@ class PRMonitorBot:
         if not ps:
             return
 
-        email = f"{username}@example.com"
+        email = f"{username}@cisco.com"
         if email in ps.notify_emails:
             self._webex.send_room_message(
                 f"`{username}` is already subscribed to PR #{num} status updates."
@@ -2117,7 +2185,7 @@ class PRMonitorBot:
             self._webex.send_room_message(f"Could not parse PR: `{parts[0]}`. Use a number or full URL.")
             return
         username = parts[1].strip().lower()
-        email = f"{username}@example.com"
+        email = f"{username}@cisco.com"
 
         key = self._pr_key(sender_email, num)
         ps = self._prs.get(key)
@@ -2579,7 +2647,7 @@ class PRMonitorBot:
             "---\n\n"
             "**Suggestions or feedback**\n\n"
             "Please **unicast** (send a direct message on Webex) to "
-            "**Venkata Gouri Rajesh Etla** (`vrajeshe`, **your-email@example.com**). "
+            "**Venkata Gouri Rajesh Etla** (`vrajeshe`, **vrajeshe@cisco.com**). "
             "Type `help` in a DM or in this space after you register for command details."
         )
         registered = {e.lower() for e in self._user_store.all_emails()}
